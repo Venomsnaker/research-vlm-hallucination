@@ -43,7 +43,7 @@ def extract_output(model_bundle: ModelBundle, answer: str, image_path: str = Non
     output, tokenization_length = extract_output_pipeline(model_bundle, messages)
     return output, tokenization_length
 
-def batch_extract_output(data_list, model_bundle: ModelBundle, processed_outputs: dict=None, mask_mode=None, save_path=None, save_interval=100):
+def batch_extract_output(dataset, model_bundle: ModelBundle, processed_outputs: dict=None, mask_mode=None, save_path=None, save_interval=100):
     '''
     mask_mode: None, 'all', 'image' or 'question'
     '''
@@ -55,7 +55,7 @@ def batch_extract_output(data_list, model_bundle: ModelBundle, processed_outputs
         processed_outputs = {}
     processed_ids = set(processed_outputs.keys())
 
-    for data in tqdm(data_list, desc='Extract output:'):
+    for data in tqdm(dataset, desc='Extract output:'):
         if data['id'] in processed_ids:
             continue
 
@@ -67,14 +67,14 @@ def batch_extract_output(data_list, model_bundle: ModelBundle, processed_outputs
             mask_mode=mask_mode
         )
         processed_outputs[data['id']] = {
-            'hidden_states': tuple(h.detach().cpu() for h in tensor_output.hidden_states),
+            'last_hidden_states': tensor_output.hidden_states[-1].detach().cpu(),
             'logits': tensor_output.logits.detach().cpu(),
             'tokenization_length': tokenization_length,
             'label': data['label']
         }
         
-        if save_path is not None:
-            if save_path is not None and len(processed_outputs) % save_interval == 0:
+        # Save outputs
+        if save_path is not None and len(processed_outputs) % save_interval == 0:
                 torch.save(processed_outputs, save_path)
 
         # Clean up
@@ -82,7 +82,7 @@ def batch_extract_output(data_list, model_bundle: ModelBundle, processed_outputs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Final save
+    # Save final outputs
     if save_path is not None:
         torch.save(processed_outputs, save_path)
     return processed_outputs

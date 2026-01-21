@@ -2,7 +2,7 @@ from tqdm import tqdm
 import gc
 import torch
 
-from egh_vlm.hallucination_dataset import HallucinationDataset, save_features
+from egh_vlm.hallucination_dataset import HallucinationDataset, save_feature
 from egh_vlm.utils import ModelBundle
 
 def start_timer():
@@ -17,7 +17,7 @@ def end_timer(start):
     elapsed_time = start.elapsed_time(end) / 1000.0  # Convert to seconds
     return elapsed_time
 
-def extract_features_pipeline(model_bundle: ModelBundle, context_messages: list, answer_messages: list):
+def extract_feature_pipeline(model_bundle: ModelBundle, context_messages: list, answer_messages: list, targeted_layer: int = -1):
     model, processor, device = model_bundle.model, model_bundle.processor, model_bundle.device
     # timers = {}
     
@@ -52,8 +52,8 @@ def extract_features_pipeline(model_bundle: ModelBundle, context_messages: list,
         a_prob = a_output.logits.squeeze(0)[1:, :]
 
         # Extract last hidden states
-        c_vector = c_output.hidden_states[-1]
-        a_vector = a_output.hidden_states[-1]
+        c_vector = c_output.hidden_states[targeted_layer]
+        a_vector = a_output.hidden_states[targeted_layer]
 
         # Compute KL divergence & gradient
         kl_divergence = torch.sum(
@@ -83,9 +83,10 @@ def extract_features_pipeline(model_bundle: ModelBundle, context_messages: list,
     # print(f"Timing breakdown: {timers}")
     return res_emb, res_grad
 
-def extract_features(model_bundle: ModelBundle, answer: str, image_path: str = None, question: str = None, mask_mode=None):
+def extract_feature(model_bundle: ModelBundle, answer: str, image_path: str = None, question: str = None, mask_mode=None, targeted_layer: int = -1):
     '''
     mask_mode: None, 'image' or 'question'
+    targeted_layer: The layer index from which to extract features
     '''
     if mask_mode not in [None, 'image', 'question']:
         print('Incorrect mask mode')
@@ -97,7 +98,7 @@ def extract_features(model_bundle: ModelBundle, answer: str, image_path: str = N
         context.append({'type': 'image', 'image': image_path})
     if question is not None and mask_mode != 'question':
         context.append({'type': 'text', 'text': question})
-    
+
     context_messages = [
         {'role': 'user', 'content': context},
         {'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]}
@@ -106,49 +107,59 @@ def extract_features(model_bundle: ModelBundle, answer: str, image_path: str = N
         {'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]}
     ]
 
-    emb, grad = extract_features_pipeline(model_bundle, context_messages, answer_messages)
+    emb, grad = extract_feature_pipeline(model_bundle, context_messages, answer_messages, targeted_layer=targeted_layer)
     return emb, grad
 
-def batch_extract_features(data_list, model_bundle: ModelBundle, features: HallucinationDataset=None, mask_mode=None, save_path: str=None, save_interval=20):
+def batch_extract_feature(dataset, model_bundle: ModelBundle, processed_features: HallucinationDataset=None, mask_mode=None, targeted_layer: int = -1, save_path: str=None, save_interval=20):
     '''
     mask_mode: None, 'image' or 'question'
+    targeted_layer: The layer index from which to extract features
     '''
     if mask_mode not in [None, 'image', 'question']:
-        print('Incorrect mask mode')
+        print('Incorrect mask mode.')
         return None
 
-    if features is None:
-        features = HallucinationDataset()
-    processed_ids = features.ids
+    if processed_features is None:
+        processed_features = HallucinationDataset()
+    processed_ids = set(processed_features.ids)
 
-    for data in tqdm(data_list, desc='Extract features:'):
+    for data in tqdm(dataset, desc='Extract features:'):
         if data['id'] in processed_ids:
             continue
         
-        emb, grad = extract_features(
+        emb, grad = extract_feature(
             model_bundle,
             answer = data['answer'],
             image_path = data['image_path'],
             question=data['question'],
-            mask_mode=mask_mode
+            mask_mode=mask_mode,
+            targeted_layer=targeted_layer
         )
 
-        # Exclude empty, NaN, and inf features 
-        if emb.numel() > 0 and grad.numel() > 0:
-            if not torch.isnan(emb).any() and not torch.isinf(emb).any() and not torch.isnan(grad).any() and not torch.isinf(grad).any():
-                features.add_item(data['id'], emb, grad, data['label'])
+        # Exclude empty, NaN, and inf features
+        has_non_empty_features = emb.numel() > 0 and grad.numel() > 0
+        has_valid_values = (
+            not torch.isnan(emb).any()
+            and not torch.isinf(emb).any()
+            and not torch.isnan(grad).any()
+            and not torch.isinf(grad).any()
+        )
+
+        if has_non_empty_features and has_valid_values:
+            processed_features.add_item(data['id'], emb, grad, data['label'])
+        else:
+            print(f"Skipping id={data['id']} due to invalid features.")
         
         # Save features
-        if save_path is not None:
-            if len(features) % save_interval == 0:
-                save_features(features, save_path)
+        if save_path is not None and len(processed_features) % save_interval == 0:
+            save_feature(processed_features, save_path)
 
         # Clean up
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Final save
+    # Save final features
     if save_path is not None:
-        save_features(features, save_path)
-    return features
+        save_feature(processed_features, save_path)
+    return processed_features

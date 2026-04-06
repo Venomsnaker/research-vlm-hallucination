@@ -110,7 +110,7 @@ def extract_features(model_bundle: ModelBundle, answer: str, image_path: str = N
     ]
     return extract_features_pipeline(model_bundle, context_messages, answer_messages, targeted_layer=targeted_layer)
 
-def batch_extract_feature(dataset, model_bundle: ModelBundle, processed_features: HallucinationDataset=None, mask_mode=None, targeted_layer: int = -1, save_path: str=None, save_interval=20):
+def batch_extract_features(dataset, model_bundle: ModelBundle, processed_features: HallucinationDataset=None, mask_mode=None, targeted_layer: int = -1, save_path: str=None, save_interval=20):
     '''
     mask_mode: None, 'image' or 'question'
     targeted_layer: The layer index from which to extract features

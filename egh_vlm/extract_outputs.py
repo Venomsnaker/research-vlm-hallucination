@@ -47,7 +47,7 @@ def extract_outputs(model_bundle: ModelBundle, answer: str, image_path: str = No
     messages.append({'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]})
     return extract_outputs_pipeline(model_bundle, messages)
 
-def batch_extract_output(dataset, model_bundle: ModelBundle, processed_outputs: dict=None, mask_mode=None, save_path=None, save_interval=100):
+def batch_extract_outputs(dataset, model_bundle: ModelBundle, processed_outputs: dict=None, mask_mode=None, save_path=None, save_interval=100):
     '''
     mask_mode: None, 'all', 'image' or 'question'
     '''

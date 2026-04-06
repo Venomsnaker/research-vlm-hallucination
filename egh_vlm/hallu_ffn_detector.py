@@ -61,7 +61,7 @@ def eval_ffn_detector(detector: HalluFFNDetector, data_loader: DataLoader):
         precision, recall, cm = precision_recall_curve(total_label, total_pred)
         pr_auc = auc(recall, precision)
     return {
-        'accuracy': acc,
-        'f1_score': f1,
+        'acc': acc,
+        'f1': f1,
         'pr_auc': pr_auc
     } 

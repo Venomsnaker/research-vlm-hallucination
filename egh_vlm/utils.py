@@ -5,10 +5,36 @@ import torch
 
 
 @dataclass
-class ModelBundle:
+class Qwen3ModelBundle:
     model: any
     processor: any
     device: torch.device
+    
+def get_response_qwen3(
+    messages, 
+    model_bundle: Qwen3ModelBundle, 
+    max_new_tokens: int=64):
+    model, processor, device = model_bundle.model, model_bundle.processor, model_bundle.device
+    
+    inputs = processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+        return_tensors='pt'
+    ).to(device)
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=max_new_tokens)
+    generated_ids_trimmed = [
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    return output_text[0] if len(output_text) == 1 else output_text
+    
+def save_dataset(dataset: list, save_path: str):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(dataset, f, indent=4)
 
 def get_pred(response):
     if 'yes' in response.strip()[:10].lower():
@@ -18,12 +44,7 @@ def get_pred(response):
     return 0.5
 
 def get_img_path(img_folder_path: str, img_name, dataset='phd') -> str:
-    '''
-    dataset: 'egh_vlm', 'phd', or 'hallusion_bench'
-    '''
-    if dataset == 'egh_vlm':
-        return os.path.join(img_folder_path, img_name)
-    elif dataset == 'phd':
+    if dataset == 'phd':
         for subfolder_name in ['train2014', 'val2014']:
             subfolder_path = os.path.join(img_folder_path, subfolder_name)
             if os.path.exists(subfolder_path):
@@ -33,48 +54,9 @@ def get_img_path(img_folder_path: str, img_name, dataset='phd') -> str:
                     return img_path 
         print(f'Image {img_name} not found in PHD dataset.')
         return ''
-    elif dataset == 'hallusion_bench':
-        return img_folder_path + img_name[1:]
     else:
         print('Dataset not recognized.')
         return ''
-
-def load_egh_dataset(dataset_path: str, img_folder_path: str, sample_size: int=None) -> list:
-    dataset = []
-
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        raw_dataset = json.load(f)
-    if sample_size is not None and len(raw_dataset) > sample_size:
-        raw_dataset = raw_dataset[:sample_size]
-
-    for item in raw_dataset:
-        item['image_path'] = get_img_path(img_folder_path, item['image_id'], 'egh_vlm')
-        dataset.append(item)
-    print(f'Successfully load the EHG dataset with: {len(dataset)} samples.')
-    return dataset
-
-def load_hallusion_bench_dataset(dataset_path: str, img_folder_path: str, sample_size: int=None) -> list:
-    dataset = []
-
-    with open(dataset_path, 'r', encoding='utf-8') as f:
-        raw_dataset = json.load(f)
-    if sample_size is not None and len(raw_dataset) > sample_size:
-        raw_dataset = raw_dataset[:sample_size]
-
-    for item in raw_dataset:
-        dataset.append({
-            'id': item['id'],
-            'category': item['category'],
-            'subcategory': item['subcategory'],
-            'question': item['question'],
-            'image_path': get_img_path(img_folder_path, item['filename'], 'hallusion_bench'),
-            'gt_answer': item['gt_answer'],
-            'gt_answer_label': int(item['gt_answer_label']),
-            'answer': item['qwen3_vl_2b_response'],
-            'label': item['hallucinated_label'],
-        })
-    print(f'Successfully load the Hallusion Bench dataset with: {len(dataset)} samples.')
-    return dataset
 
 def load_phd_dataset(dataset_path: str, img_folder_path: str, sample_size: int=None) -> list:
     dataset = []
@@ -87,7 +69,7 @@ def load_phd_dataset(dataset_path: str, img_folder_path: str, sample_size: int=N
     for item in raw_dataset:
         dataset.append({
             'id': item['id'],
-            'couple_idx': item['couple_idx'],
+            'couple_id': item['couple_id'],
             'task': item['task'],
             'hitem': item['hitem'],
             'subject': item['subject'],
@@ -95,7 +77,7 @@ def load_phd_dataset(dataset_path: str, img_folder_path: str, sample_size: int=N
             'question': item['question'],
             'image_path': get_img_path(img_folder_path, item['image_id'], 'phd'),
             'question_gt': item['question_gt'],
-            'answer': item['qwen3_vl_2b_response'],
+            'answer': item['answer'],
             'label': item['hallucinated_label'],
         })
     print(f'Successfully load the PhD dataset with: {len(dataset)} samples.')

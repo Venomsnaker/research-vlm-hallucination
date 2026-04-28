@@ -1,4 +1,4 @@
-# Hallucination Detection & Mitigation in VLM models
+# Research about hallucination in VLMs
 ## Contributors
 - Venomsnaker
 - MinhQuan1909

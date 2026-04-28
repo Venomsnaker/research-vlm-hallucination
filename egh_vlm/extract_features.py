@@ -1,167 +1,180 @@
+import os
 from tqdm import tqdm
 import gc
 import torch
 
-from egh_vlm.hallu_dataset import HalluDataset, save_hallu_dataset
-from egh_vlm.utils import ModelBundle
+from egh_vlm.hallu_dataset import HalluDataset, save_hallu_dataset, load_hallu_dataset
+from egh_vlm.utils import Qwen3ModelBundle
 
-def start_timer():
-    start = torch.cuda.Event(enable_timing=True)
-    start.record()
-    return start
 
-def end_timer(start):
-    end = torch.cuda.Event(enable_timing=True)
-    end.record()
-    torch.cuda.synchronize()
-    elapsed_time = start.elapsed_time(end) / 1000.0  # Convert to seconds
-    return elapsed_time
-
-def extract_features_pipeline(model_bundle: ModelBundle, context_messages: list, answer_messages: list, targeted_layer: int = -1):
+def extract_features_qwen3(
+    context_messages: list, 
+    answer_messages: list, 
+    model_bundle: Qwen3ModelBundle, 
+    targeted_layer: int = -1):
     """
-    Return embedding and gradient features
+    Return embed & grad features
     """
     model, processor, device = model_bundle.model, model_bundle.processor, model_bundle.device
-    # timers = {}
     
-    # Tokenize inputs
-    # t_tokenization = start_timer()
     c_ids = processor.apply_chat_template(
         context_messages, tokenize=True, add_generation_prompt=False, return_dict=True, return_tensors='pt'
     )
     a_ids = processor.apply_chat_template(
         answer_messages, tokenize=True, add_generation_prompt=False, return_dict=True, return_tensors='pt'
     )
+    # Move tensors to device
     c_ids = {k: v.to(device) for k, v in c_ids.items()}
     a_ids = {k: v.to(device) for k, v in a_ids.items()}
-    # timers['tokenization'] = end_timer(t_tokenization)
 
     with torch.set_grad_enabled(True):
         model.eval()
 
-        # Forward pass
-        # t_forward = start_timer()
         c_output = model(**c_ids, output_hidden_states=True)
         a_output = model(**a_ids, output_hidden_states=True)
-        # timers['forward_pass'] = end_timer(t_forward)
-
-        # Gradient computation
-        # t_gradient = start_timer()
         c_length = c_ids['input_ids'].shape[1]
         a_length = a_ids['input_ids'].shape[1]
 
-        # Extract answer prob (slice after context)
         c_prob = c_output.logits.squeeze(0)[c_length - a_length + 1:, :]
         a_prob = a_output.logits.squeeze(0)[1:, :]
 
-        # Extract last hidden states
         c_vector = c_output.hidden_states[targeted_layer]
         a_vector = a_output.hidden_states[targeted_layer]
 
         # Compute KL divergence & gradient
+        c_prob_float = c_prob.float()
+        a_prob_float = a_prob.float()
+        a_prob_softmax = a_prob_float.softmax(dim=-1)
         kl_divergence = torch.sum(
-            a_prob.softmax(dim=-1) * (a_prob.softmax(dim=-1).log() - torch.log_softmax(c_prob, dim=-1))
+            a_prob_softmax * (a_prob_softmax.log() - torch.log_softmax(c_prob_float, dim=-1))
         )
-        grad = torch.autograd.grad(
-            outputs=kl_divergence, inputs=a_vector, create_graph=False, allow_unused=True,
-        )
-        # Fallback to zeros if gradient is None
-        if grad[0] is not None:
-            grad = grad[0].squeeze(0)[1:, :]
-        else:
+        try:
+            grad = torch.autograd.grad(
+                outputs=kl_divergence, inputs=a_vector, create_graph=False, allow_unused=True,
+            )[0]
+            if grad is None:
+                raise RuntimeError('Gradient is None.')
+            grad = grad.squeeze(0)[1:, :]
+        except Exception:
+            # Fallback to zeros if gradient computation fails
             grad = torch.zeros_like(a_vector.squeeze(0)[1:, :])
-        # timers['gradient_computation'] = end_timer(t_gradient)
 
-        # Compute embedding
-        # t_embedding = start_timer()
+        # Compute embedding difference
         a_emb = a_vector.squeeze(0)[1:, :]
         c_emb = c_vector.squeeze(0)[c_length - a_length + 1:, :]
         emb = c_emb - a_emb
-        # timers['embedding_computation'] = end_timer(t_embedding)
-        
-    # print(f"Timing breakdown: {timers}")
+
+    emb_cpu = emb.detach().to('cpu')
+    grad_cpu = grad.detach().to('cpu')
+
+    # Clean up resources
+    del c_ids, a_ids
+    del c_output, a_output
+    del c_prob, a_prob, c_prob_float, a_prob_float, a_prob_softmax, kl_divergence
+    del c_vector, a_vector, a_emb, c_emb, emb, grad
+
     return {
-        'emb': emb.detach().float().to('cpu'),
-        'grad': grad.detach().float().to('cpu')
+        'emb': emb_cpu,
+        'grad': grad_cpu
     }
 
-def extract_features(model_bundle: ModelBundle, answer: str, image_path: str = None, question: str = None, mask_mode=None, targeted_layer: int = -1):
+def extract_features(
+    dataset: any,
+    model_bundle: any,
+    client_type: str='qwen3',
+    save_path: str=None,
+    save_interval: int=20,
+    mask_mode: str=None,
+    targeted_layer: int=-1):
     '''
+    model_bundle: Qwen3ModelBundle
+    client_type: 'qwen3'
     mask_mode: None, 'image' or 'question'
     targeted_layer: The layer index from which to extract features
     '''
+    
+    if client_type not in ['qwen3']:
+        print('Unsupported client')
+        return None
+    
     if mask_mode not in [None, 'image', 'question']:
         print('Incorrect mask mode')
         return None
-
-    context = []
-
-    if image_path is not None and mask_mode != 'image':
-        context.append({'type': 'image', 'image': image_path})
-    if question is not None and mask_mode != 'question':
-        context.append({'type': 'text', 'text': question})
-
-    context_messages = [
-        {'role': 'user', 'content': context},
-        {'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]}
-    ]
-    answer_messages = [
-        {'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]}
-    ]
-    return extract_features_pipeline(model_bundle, context_messages, answer_messages, targeted_layer=targeted_layer)
-
-def batch_extract_features(dataset, model_bundle: ModelBundle, processed_features: HallucinationDataset=None, mask_mode=None, targeted_layer: int = -1, save_path: str=None, save_interval=20):
-    '''
-    mask_mode: None, 'image' or 'question'
-    targeted_layer: The layer index from which to extract features
-    '''
-    if mask_mode not in [None, 'image', 'question']:
-        print('Incorrect mask mode.')
-        return None
-
-    if processed_features is None:
-        processed_features = HalluDataset()
+    
+    # Load processed_features
+    processed_features = HalluDataset()
+    
+    if save_path is not None and os.path.exists(save_path):
+        processed_features = load_hallu_dataset(save_path)
     processed_ids = set(processed_features.ids)
-
-    for data in tqdm(dataset, desc='Extract features:'):
-        if data['id'] in processed_ids:
-            continue
+    
+    if client_type == 'qwen3':
+        for item in tqdm(dataset, desc=f'Extracting features for client {client_type}'):
+            if item['id'] in processed_ids:
+                continue
+            
+            question = item['question']
+            image_path = item['image_path']
+            answer = item['answer']
+            
+            # Construct messages context
+            context = []
         
-        result = extract_features(
-            model_bundle= model_bundle,
-            answer = data['answer'],
-            image_path = data['image_path'],
-            question=data['question'],
-            mask_mode=mask_mode,
-            targeted_layer=targeted_layer
-        )
-        emb = result['emb']
-        grad = result['grad']
+            if image_path is not None and mask_mode != 'image':
+                context.append({'type': 'image', 'image': image_path})
+            if question is not None and mask_mode != 'question':
+                context.append({'type': 'text', 'text': question})
 
-        # Exclude empty, NaN, and inf features
-        has_non_empty_features = emb.numel() > 0 and grad.numel() > 0
-        has_valid_values = (
-            not torch.isnan(emb).any()
-            and not torch.isinf(emb).any()
-            and not torch.isnan(grad).any()
-            and not torch.isinf(grad).any()
-        )
+            # Construct messages
+            context_messages = [
+                {'role': 'user', 'content': context},
+                {'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]}
+            ]
+            answer_messages = [
+                {'role': 'assistant', 'content': [{'type': 'text', 'text': answer}]}
+            ]
+            
+            # Extract features
+            features = extract_features_qwen3(
+                context_messages=context_messages,
+                answer_messages=answer_messages,
+                model_bundle=model_bundle,
+                targeted_layer=targeted_layer
+            )
+            emb = features['emb']
+            grad = features['grad']
+            
+            # Exclude empty, NaN, and inf features
+            has_non_empty_features = emb.numel() > 0 and grad.numel() > 0
+            has_valid_values = (
+                not torch.isnan(emb).any()
+                and not torch.isinf(emb).any()
+                and not torch.isnan(grad).any()
+                and not torch.isinf(grad).any()
+            )
+            
+            if has_non_empty_features and has_valid_values:
+                processed_features.add_item(item['id'], emb, grad, item['label'])
+            else:
+                print(f"Skipping id={item['id']} due to invalid features.")
+                continue
+            
+            # Save features
+            if save_path is not None and len(processed_features) % save_interval == 0:
+                save_hallu_dataset(processed_features, save_path)
 
-        if has_non_empty_features and has_valid_values:
-            processed_features.add_item(data['id'], emb, grad, data['label'])
-        else:
-            print(f"Skipping id={data['id']} due to invalid features.")
-        
-        # Save features
-        if save_path is not None and len(processed_features) % save_interval == 0:
+            # Clean up resources
+            del features, emb, grad, context_messages, answer_messages, context
+            # Clean up GPU memory
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        # Final save
+        if save_path is not None:
             save_hallu_dataset(processed_features, save_path)
-
-        # Clean up
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # Save final features
-    if save_path is not None:
-        save_hallu_dataset(processed_features, save_path)
-    return processed_features
+            
+        return processed_features
+    else:
+        print('Unsupported client')
+        return None
